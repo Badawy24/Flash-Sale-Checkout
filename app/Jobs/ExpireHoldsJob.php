@@ -34,13 +34,18 @@ class ExpireHoldsJob implements ShouldQueue
             'count' => $expiredHolds->count(),
         ]);
 
+        $expiredCount = 0;
+        $usedCount = 0;
+        $skippedCount = 0;
+
         foreach ($expiredHolds as $hold) {
-            DB::transaction(function () use ($hold, $holdRepository, $orderRepository, $productRepository) {
+            DB::transaction(function () use ($hold, $holdRepository, $orderRepository, $productRepository, &$expiredCount, &$usedCount, &$skippedCount) {
                 // Lock the hold to prevent race conditions using repository
                 $lockedHold = $holdRepository->findActiveByIdWithLock($hold->id);
 
                 if (!$lockedHold) {
                     // Hold was already processed
+                    $skippedCount++;
                     return;
                 }
 
@@ -50,6 +55,12 @@ class ExpireHoldsJob implements ShouldQueue
                 if ($existingOrder) {
                     // Hold was used, mark as used instead of expired
                     $holdRepository->markAsUsed($lockedHold);
+                    $usedCount++;
+
+                    Log::info('Hold marked as used during expiry check', [
+                        'hold_id' => $lockedHold->id,
+                        'order_id' => $existingOrder->id,
+                    ]);
                     return;
                 }
 
@@ -61,14 +72,23 @@ class ExpireHoldsJob implements ShouldQueue
                 if ($lockedHold->product) {
                     $product = $productRepository->findByIdWithLock($lockedHold->product_id);
                     $productRepository->releaseStock($product, $lockedHold->quantity);
+                    $expiredCount++;
 
                     Log::info('Hold expired and stock released', [
                         'hold_id' => $lockedHold->id,
                         'product_id' => $product->id,
                         'quantity_released' => $lockedHold->quantity,
+                        'user_id' => $lockedHold->user_id,
                     ]);
                 }
             });
         }
+
+        Log::info('Hold expiry job completed', [
+            'total_found' => $expiredHolds->count(),
+            'expired' => $expiredCount,
+            'marked_as_used' => $usedCount,
+            'skipped' => $skippedCount,
+        ]);
     }
 }

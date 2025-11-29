@@ -9,6 +9,7 @@ use App\Repositories\HoldRepository;
 use App\Repositories\OrderRepository;
 use App\Repositories\ProductRepository;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class PaymentWebhookController extends Controller
 {
@@ -20,92 +21,152 @@ class PaymentWebhookController extends Controller
 
     public function handlePaymentWebhook(PaymentWebhookRequest $request)
     {
-        return DB::transaction(function () use ($request) {
+        $startTime = microtime(true);
 
-            $existingOrder = $this->orderRepository->findByPaymentWebhookReference(
-                $request->idempotency_key
-            );
+        try {
+            return DB::transaction(function () use ($request, $startTime) {
+                // Check idempotency first
+                $existingOrder = $this->orderRepository->findByPaymentWebhookReference(
+                    $request->idempotency_key
+                );
 
-            if ($existingOrder) {
-                return response()->json([
-                    'message' => 'Webhook already processed',
-                    'order_status' => $existingOrder->status->value,
-                ], 200);
-            }
+                if ($existingOrder) {
+                    Log::info('Webhook deduplication: already processed', [
+                        'idempotency_key' => $request->idempotency_key,
+                        'order_id' => $existingOrder->id,
+                        'order_status' => $existingOrder->status->value,
+                    ]);
 
-            $order = $this->orderRepository->findByIdWithLock($request->order_id);
+                    return response()->json([
+                        'message' => 'Webhook already processed',
+                        'order_status' => $existingOrder->status->value,
+                    ], 200);
+                }
 
-            if (! $order) {
-                return response()->json([
-                    'message' => 'Order not found. Please retry.',
-                ], 404);
-            }
+                $order = $this->orderRepository->findByIdWithLock($request->order_id);
 
-            // Check if order is already processed (status is cast to StatusEnum)
-            if ($order->status !== StatusEnum::PENDING) {
-                if (! $order->payment_webhook_reference) {
+                if (! $order) {
+                    Log::warning('Webhook received for non-existent order', [
+                        'order_id' => $request->order_id,
+                        'idempotency_key' => $request->idempotency_key,
+                        'status' => $request->status,
+                    ]);
+
+                    return response()->json([
+                        'message' => 'Order not found. Please retry.',
+                    ], 404);
+                }
+
+                // Check if order is already processed (status is cast to StatusEnum)
+                if ($order->status !== StatusEnum::PENDING) {
+                    if (! $order->payment_webhook_reference) {
+                        $this->orderRepository->updatePaymentWebhookReference(
+                            $order,
+                            $request->idempotency_key
+                        );
+                    }
+
+                    Log::info('Webhook received for already processed order', [
+                        'order_id' => $order->id,
+                        'idempotency_key' => $request->idempotency_key,
+                        'current_status' => $order->status->value,
+                        'webhook_status' => $request->status,
+                    ]);
+
+                    return response()->json([
+                        'message' => 'Order already processed',
+                        'order_status' => $order->status->value,
+                    ], 200);
+                }
+
+                // Process webhook
+                if ($request->status === 'paid') {
+                    // Update order status
+                    $this->orderRepository->updateStatus($order, StatusEnum::PAID);
                     $this->orderRepository->updatePaymentWebhookReference(
                         $order,
                         $request->idempotency_key
                     );
+
+                    // Refresh order to get latest data
+                    $order->refresh();
+
+                    // Fulfill order: reduce actual stock and reserved stock
+                    if ($order->product) {
+                        // Lock product to prevent race conditions
+                        $product = $this->productRepository->findByIdWithLock($order->product_id);
+                        $this->productRepository->fulfillOrder($product, $order->quantity);
+
+                        Log::info('Payment webhook processed: order paid and fulfilled', [
+                            'order_id' => $order->id,
+                            'idempotency_key' => $request->idempotency_key,
+                            'product_id' => $order->product_id,
+                            'quantity' => $order->quantity,
+                            'transaction_id' => $request->transaction_id,
+                        ]);
+                    }
+
+                } else {
+                    // Payment failed - cancel order and release stock
+                    $this->orderRepository->updateStatus($order, StatusEnum::CANCELLED);
+                    $this->orderRepository->updatePaymentWebhookReference(
+                        $order,
+                        $request->idempotency_key
+                    );
+
+                    // Refresh order to get latest data
+                    $order->refresh();
+
+                    // Release reserved stock back to available
+                    if ($order->product) {
+                        // Lock product to prevent race conditions
+                        $product = $this->productRepository->findByIdWithLock($order->product_id);
+                        $this->productRepository->releaseStock($product, $order->quantity);
+                    }
+
+                    // Mark hold as expired if still active/used
+                    if ($order->hold) {
+                        $hold = $order->hold;
+                        if (in_array($hold->status, [StatusEnum::ACTIVE, StatusEnum::USED])) {
+                            $this->holdRepository->markAsExpired($hold);
+                        }
+                    }
+
+                    Log::info('Payment webhook processed: payment failed, order cancelled', [
+                        'order_id' => $order->id,
+                        'idempotency_key' => $request->idempotency_key,
+                        'product_id' => $order->product_id,
+                        'quantity' => $order->quantity,
+                        'transaction_id' => $request->transaction_id,
+                    ]);
                 }
+
+                $duration = (microtime(true) - $startTime) * 1000;
+
+                Log::info('Webhook processed successfully', [
+                    'order_id' => $order->id,
+                    'idempotency_key' => $request->idempotency_key,
+                    'status' => $request->status,
+                    'duration_ms' => round($duration, 2),
+                ]);
 
                 return response()->json([
-                    'message' => 'Order already processed',
+                    'message' => 'Webhook processed',
                     'order_status' => $order->status->value,
                 ], 200);
-            }
-
-            // Process webhook
-            if ($request->status === 'paid') {
-                // Update order status
-                $this->orderRepository->updateStatus($order, StatusEnum::PAID);
-                $this->orderRepository->updatePaymentWebhookReference(
-                    $order,
-                    $request->idempotency_key
-                );
-
-                // Refresh order to get latest data
-                $order->refresh();
-
-                // Fulfill order: reduce actual stock and reserved stock
-                if ($order->product) {
-                    // Lock product to prevent race conditions
-                    $product = $this->productRepository->findByIdWithLock($order->product_id);
-                    $this->productRepository->fulfillOrder($product, $order->quantity);
-                }
-
-            } else {
-                // Payment failed - cancel order and release stock
-                $this->orderRepository->updateStatus($order, StatusEnum::CANCELLED);
-                $this->orderRepository->updatePaymentWebhookReference(
-                    $order,
-                    $request->idempotency_key
-                );
-
-                // Refresh order to get latest data
-                $order->refresh();
-
-                // Release reserved stock back to available
-                if ($order->product) {
-                    // Lock product to prevent race conditions
-                    $product = $this->productRepository->findByIdWithLock($order->product_id);
-                    $this->productRepository->releaseStock($product, $order->quantity);
-                }
-
-                // Mark hold as expired if still active/used
-                if ($order->hold) {
-                    $hold = $order->hold;
-                    if (in_array($hold->status, [StatusEnum::ACTIVE, StatusEnum::USED])) {
-                        $this->holdRepository->markAsExpired($hold);
-                    }
-                }
-            }
+            });
+        } catch (\Exception $e) {
+            Log::error('Webhook processing failed with exception', [
+                'order_id' => $request->order_id,
+                'idempotency_key' => $request->idempotency_key,
+                'status' => $request->status,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
 
             return response()->json([
-                'message' => 'Webhook processed',
-                'order_status' => $order->status->value,
-            ], 200);
-        });
+                'message' => 'Failed to process webhook. Please retry.',
+            ], 500);
+        }
     }
 }

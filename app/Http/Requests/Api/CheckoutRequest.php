@@ -14,7 +14,11 @@ class CheckoutRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'hold_id' => 'required|exists:holds,id',
+            'hold_id' => [
+                'required',
+                'integer',
+                'exists:holds,id',
+            ],
         ];
     }
 }

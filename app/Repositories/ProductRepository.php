@@ -4,6 +4,7 @@ namespace App\Repositories;
 
 use App\Models\Product;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 
 class ProductRepository
 {
@@ -18,9 +19,22 @@ class ProductRepository
 
     public function findByIdWithLock($id): Product
     {
-        return Product::where('id', $id)
+        $startTime = microtime(true);
+        $product = Product::where('id', $id)
             ->lockForUpdate()
             ->firstOrFail();
+
+        $duration = (microtime(true) - $startTime) * 1000;
+
+        // Log if lock acquisition took longer than expected (potential contention)
+        if ($duration > 100) {
+            Log::warning('Product lock acquisition took longer than expected', [
+                'product_id' => $id,
+                'duration_ms' => round($duration, 2),
+            ]);
+        }
+
+        return $product;
     }
 
     public function getAvailableStock(Product $product): int
@@ -36,6 +50,13 @@ class ProductRepository
 
         // Clear cache
         Cache::forget("product_{$product->id}");
+
+        Log::debug('Stock reserved', [
+            'product_id' => $product->id,
+            'quantity' => $quantity,
+            'reserved' => $product->reserved,
+            'available' => $product->stock - $product->reserved,
+        ]);
     }
 
     public function releaseStock(Product $product, int $quantity): void
@@ -46,8 +67,14 @@ class ProductRepository
 
         // Clear cache
         Cache::forget("product_{$product->id}");
-    }
 
+        Log::debug('Stock released', [
+            'product_id' => $product->id,
+            'quantity' => $quantity,
+            'reserved' => $product->reserved,
+            'available' => $product->stock - $product->reserved,
+        ]);
+    }
 
     public function fulfillOrder(Product $product, int $quantity): void
     {
@@ -59,5 +86,12 @@ class ProductRepository
 
         // Clear cache
         Cache::forget("product_{$product->id}");
+
+        Log::debug('Order fulfilled, stock reduced', [
+            'product_id' => $product->id,
+            'quantity' => $quantity,
+            'stock' => $product->stock,
+            'reserved' => $product->reserved,
+        ]);
     }
 }

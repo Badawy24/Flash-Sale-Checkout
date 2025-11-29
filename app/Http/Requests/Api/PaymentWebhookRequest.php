@@ -14,10 +14,25 @@ class PaymentWebhookRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'order_id' => 'required|exists:orders,id',
-            'status' => 'required|in:paid,failed',
-            'transaction_id' => 'required|string',
-            'idempotency_key' => 'required|string',
+            'order_id' => [
+                'required',
+                'integer',
+            ],
+            'status' => [
+                'required',
+                'string',
+                'in:paid,failed',
+            ],
+            'transaction_id' => [
+                'required',
+                'string',
+                'max:255',
+            ],
+            'idempotency_key' => [
+                'required',
+                'string',
+                'max:255',
+            ],
         ];
     }
 }
