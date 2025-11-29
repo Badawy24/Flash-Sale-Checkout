@@ -30,6 +30,12 @@ class DatabaseSeeder extends Seeder
 
     public function seedUsers(): void
     {
+        User::create([
+            'name' => 'badawy',
+            'email' => 'badawy@mail.com',
+            'password' => '123456789',
+        ]);
+
         User::factory()->count(5)->create();
     }
 }
