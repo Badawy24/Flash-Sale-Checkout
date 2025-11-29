@@ -21,8 +21,8 @@ class DatabaseSeeder extends Seeder
     public function seedProducts(): void
     {
         Product::create([
-            'name' => 'Flash Sale Product',
-            'price' => 100,
+            'name' => 'Mobile Phone',
+            'price' => 1000,
             'stock' => 50,
             'reserved' => 0,
         ]);

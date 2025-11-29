@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Enums\StatusEnum;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasOne;
@@ -21,6 +22,7 @@ class Hold extends Model
         return [
             'expired_at' => 'datetime',
             'quantity' => 'integer',
+            'status' => StatusEnum::class,
         ];
     }
 
